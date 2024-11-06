@@ -1,0 +1,13 @@
+[package]
+name = "collab-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+devimint = { workspace = true }
+fedimint-client = { workspace = true }
+fedimint-core = { workspace = true }
+fedimint-testing = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
