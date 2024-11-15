@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
+bdk = { workspace = true }
 devimint = { workspace = true }
 fedimint-client = { workspace = true }
 fedimint-core = { workspace = true }
