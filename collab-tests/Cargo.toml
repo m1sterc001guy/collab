@@ -10,5 +10,9 @@ devimint = { workspace = true }
 fedimint-client = { workspace = true }
 fedimint-core = { workspace = true }
 fedimint-testing = { workspace = true }
+rand = { workspace = true }
+schnorr_fun = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

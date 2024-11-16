@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use bdk::bitcoin::psbt::PartiallySignedTransaction;
+use bdk::bitcoin::psbt::{PartiallySignedTransaction, Prevouts};
 use bdk::bitcoin::secp256k1::Secp256k1;
-use bdk::bitcoin::{Network, PrivateKey, PublicKey};
+use bdk::bitcoin::sighash::{ScriptPath, SighashCache};
+use bdk::bitcoin::taproot::Signature;
+use bdk::bitcoin::{self, Network, PrivateKey, PublicKey};
 use bdk::blockchain::EsploraBlockchain;
 use bdk::database::MemoryDatabase;
 use bdk::keys::{GeneratableDefaultOptions, GeneratedKey};
@@ -14,16 +16,44 @@ use bdk::miniscript::{miniscript, Descriptor};
 use bdk::signer::{SignerContext, SignerOrdering, SignerWrapper};
 use bdk::wallet::AddressIndex;
 use bdk::{FeeRate, KeychainKind, SignOptions, SyncOptions, Wallet};
+use fedimint_core::secp256k1::XOnlyPublicKey;
 use fedimint_testing::envs::FM_PORT_ESPLORA_ENV;
+use rand::rngs::OsRng;
+use schnorr_fun::frost::{self, FrostKey};
+use schnorr_fun::fun::marker::{Normal, Public};
+use schnorr_fun::fun::{hex, Scalar};
+use schnorr_fun::nonce::{GlobalRng, Synthetic};
+use schnorr_fun::Message;
+use serde_json::Value;
+use sha2::digest::core_api::{CoreWrapper, CtVariableCoreWrapper};
+use sha2::digest::typenum::bit::{B0, B1};
+use sha2::digest::typenum::{UInt, UTerm};
+use sha2::{OidSha256, Sha256, Sha256VarCore};
 use tracing::info;
+
+pub type Frost = schnorr_fun::frost::Frost<
+    CoreWrapper<
+        CtVariableCoreWrapper<
+            Sha256VarCore,
+            UInt<UInt<UInt<UInt<UInt<UInt<UTerm, B1>, B0>, B0>, B0>, B0>, B0>,
+            OidSha256,
+        >,
+    >,
+    Synthetic<
+        CoreWrapper<
+            CtVariableCoreWrapper<
+                Sha256VarCore,
+                UInt<UInt<UInt<UInt<UInt<UInt<UTerm, B1>, B0>, B0>, B0>, B0>, B0>,
+                OidSha256,
+            >,
+        >,
+        GlobalRng<OsRng>,
+    >,
+>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     devimint::run_devfed_test(|dev_fed, _process_mgr| async move {
-        //let gw_lnd = dev_fed.gw_lnd().await?;
-        //let info = gw_lnd.get_info().await?;
-        //info!(?info, "GW LND Info");
-
         let network = Network::Regtest;
         let secp = Secp256k1::new();
 
@@ -39,11 +69,13 @@ async fn main() -> anyhow::Result<()> {
         let private_key2 = private_key2.into_key();
         let public_key2 = PublicKey::from_private_key(&secp, &private_key2);
 
-        let private_key3: GeneratedKey<_, miniscript::Tap> = PrivateKey::generate_default()?;
-        let private_key3 = private_key3.into_key();
-        let public_key3 = PublicKey::from_private_key(&secp, &private_key3);
+        let frost = frost::new_with_synthetic_nonces::<Sha256, rand::rngs::OsRng>();
+        let (frost_key, shares) = frost_dkg(&frost);
+        info!(?shares, "FROST SHARES");
+        let frost_public_key = frost_key.public_key().to_bytes();
+        let frost_pub_key = PublicKey::from_slice(&frost_public_key).unwrap();
 
-        let keys = [public_key1, public_key2, public_key3];
+        let keys = [public_key1, public_key2, frost_pub_key];
 
         let keys_joined: String = keys
             .into_iter()
@@ -64,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         let address = wallet.get_address(AddressIndex::New).unwrap();
         let bitcoind = dev_fed.bitcoind().await.unwrap();
         bitcoind
-            .generate_to_address(200, &address.address)
+            .generate_to_address(101, &address.address)
             .await
             .unwrap();
 
@@ -91,14 +123,16 @@ async fn main() -> anyhow::Result<()> {
             .policy_path(path, KeychainKind::External);
         let (mut psbt, details) = tx_builder.finish().unwrap();
 
-        //info!(?psbt, "PSBT");
         info!(?details, "TransactionDetails");
 
+        //frost_sign_psbt(&mut psbt, &frost, frost_key, shares);
+        sign_psbt(&mut wallet, private_key1, &mut psbt);
         sign_psbt(&mut wallet, private_key2, &mut psbt);
-        sign_psbt(&mut wallet, private_key3, &mut psbt);
 
         let tx = psbt.extract_tx();
-        //info!(?tx, "Transaction");
+        let hex_tx = hex::encode(&bitcoin::consensus::encode::serialize(&tx));
+        info!(?hex_tx, "HexTx");
+
         esplora.broadcast(&tx).unwrap();
 
         // Mine some blocks
@@ -129,4 +163,69 @@ fn sign_psbt(
     wallet.add_signer(KeychainKind::External, SignerOrdering(0), Arc::new(signer));
     let finalized = wallet.sign(psbt, SignOptions::default()).unwrap();
     info!(?finalized, "Finalized");
+}
+
+fn frost_dkg(frost: &Frost) -> (FrostKey<Normal>, BTreeMap<Scalar<Public>, Scalar>) {
+    let shares = frost.simulate_keygen(1, 2, &mut OsRng);
+    shares
+}
+
+fn frost_sign_psbt(
+    psbt: &mut PartiallySignedTransaction,
+    frost: &Frost,
+    frost_key: FrostKey<Normal>,
+    shares: BTreeMap<Scalar<Public>, Scalar>,
+) {
+    let txouts = psbt
+        .inputs
+        .iter()
+        .map(|input| input.witness_utxo.as_ref().expect("no witness").clone())
+        .collect::<Vec<_>>();
+    let prevouts = Prevouts::All(&txouts);
+    let mut cache = SighashCache::new(&psbt.unsigned_tx);
+    let xonly_frost_key = frost_key.clone().into_xonly_key();
+    let xonly_bytes = frost_key.public_key().to_xonly_bytes();
+    let xonly_key = XOnlyPublicKey::from_slice(&xonly_bytes).unwrap();
+    for (index, input) in psbt.inputs.iter_mut().enumerate() {
+        if input.final_script_sig.is_some() || input.final_script_witness.is_some() {
+            continue;
+        }
+
+        let script = input
+            .tap_scripts
+            .first_key_value()
+            .expect("One script path")
+            .1
+             .0
+            .clone();
+        let script_path = ScriptPath::with_defaults(script.as_script());
+        let sighash = cache
+            .taproot_script_spend_signature_hash(
+                index,
+                &prevouts,
+                script_path.clone(),
+                bdk::bitcoin::sighash::TapSighashType::All,
+            )
+            .unwrap();
+
+        // Sign with the FROST key share
+        let message = Message::raw(&sighash[..]);
+        let nonce1 = schnorr_fun::musig::NonceKeyPair::random(&mut rand::rngs::OsRng);
+        let (index, share) = shares.first_key_value().expect("no shares");
+        let nonces = BTreeMap::from_iter([(index.clone(), nonce1.public())]);
+        let session = frost.start_sign_session(&xonly_frost_key, nonces, message);
+        let sig_share = frost.sign(&xonly_frost_key, &session, index.clone(), share, nonce1);
+        let combined_sig =
+            frost.combine_signature_shares(&xonly_frost_key, &session, vec![sig_share]);
+        info!(?combined_sig, "Combined FROST Signature");
+        assert!(frost
+            .schnorr
+            .verify(&xonly_frost_key.public_key(), message, &combined_sig));
+
+        // Add signature to PSBT
+        let sig = Signature::from_slice(&combined_sig.to_bytes()).unwrap();
+        input
+            .tap_script_sigs
+            .insert((xonly_key, script_path.leaf_hash()), sig);
+    }
 }
